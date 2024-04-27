@@ -179,7 +179,7 @@ export const handleBatch = async (
   req: NextApiRequest,
   authCheck: AuthHeaderVerificationResult,
 ) => {
-  console.log("handling ingestion event", JSON.stringify(events, null, 2));
+  console.log(`handling ingestion event with ${events.length} events`);
 
   if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
 
@@ -254,8 +254,7 @@ const handleSingleEvent = async (
   apiScope: ApiAccessScope,
 ) => {
   console.log(
-    `handling single event ${event.id}`,
-    JSON.stringify(event, null, 2),
+    `handling single event ${event.id} ${event.type}`
   );
 
   const cleanedEvent = ingestionEvent.parse(cleanEvent(event));

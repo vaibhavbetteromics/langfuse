@@ -169,6 +169,11 @@ export class ObservationProcessor implements EventProcessor {
           })
         : undefined;
 
+    if (!this.event.body.traceId && !existingObservation) {
+      console.log("I am going to create an empty trace");
+      console.log(this.event.body);
+    }
+
     const traceId =
       !this.event.body.traceId && !existingObservation
         ? // Create trace if no traceid
