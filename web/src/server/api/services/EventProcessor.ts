@@ -97,7 +97,7 @@ export async function findModel(p: {
   return foundModels[0] ?? null;
 }
 
-type ObservationEvent =
+export type ObservationEvent =
   | z.infer<typeof legacyObservationCreateEvent>
   | z.infer<typeof legacyObservationUpdateEvent>
   | z.infer<typeof eventCreateEvent>
@@ -168,6 +168,11 @@ export class ObservationProcessor implements EventProcessor {
             existingDbObservation: existingObservation ?? undefined,
           })
         : undefined;
+
+    if (!this.event.body.traceId && !existingObservation) {
+      console.log("I am going to create an empty trace");
+      console.log(this.event.body);
+    }
 
     const traceId =
       !this.event.body.traceId && !existingObservation

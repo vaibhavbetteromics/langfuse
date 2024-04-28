@@ -33,3 +33,32 @@ export const persistEventMiddleware = async (
     },
   });
 };
+
+export const persistEventBatchMiddleware = async (
+  prisma: PrismaClient,
+  projectId: string,
+  req: NextApiRequest,
+  dataList: Prisma.JsonObject[],
+  metadata?: Zod.infer<typeof jsonSchema> | null,
+) => {
+  const langfuseHeadersObject = Object.fromEntries(
+    Object.entries(req.headers).filter(([key]) => key.startsWith("x-langfuse")),
+  );
+
+  const events = dataList.map((data) => {
+    // combine metadata from the request and langfuseHeadersObject
+    const combinedMetadata = lodash.merge(metadata, langfuseHeadersObject);
+
+    return {
+      projectId,
+      url: req.url,
+      method: req.method,
+      data: data,
+      headers: combinedMetadata,
+    };
+  });
+
+  await prisma.events.createMany({
+    data: events,
+  });
+};

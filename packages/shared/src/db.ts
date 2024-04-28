@@ -17,10 +17,10 @@ import { DB } from ".";
 
 const prismaClientSingleton = () => {
   return new PrismaClient({
-    log:
-      env.NODE_ENV === "development"
-        ? ["query", "error", "warn"]
-        : ["error", "warn"],
+    log: ["error", "warn"],
+      // env.NODE_ENV === "development"
+      //   ? ["query", "error", "warn"]
+      //   : ["error", "warn"],
   });
 };
 
