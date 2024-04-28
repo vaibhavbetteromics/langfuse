@@ -97,7 +97,7 @@ export async function findModel(p: {
   return foundModels[0] ?? null;
 }
 
-type ObservationEvent =
+export type ObservationEvent =
   | z.infer<typeof legacyObservationCreateEvent>
   | z.infer<typeof legacyObservationUpdateEvent>
   | z.infer<typeof eventCreateEvent>

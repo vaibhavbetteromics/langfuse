@@ -3,22 +3,27 @@ import {
   verifyAuthHeaderAndReturnScope,
 } from "@/src/features/public-api/server/apiAuth";
 import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
-import { prisma } from "@langfuse/shared/src/db";
+import { prisma, Prisma } from "@langfuse/shared/src/db";
 import { type NextApiRequest, type NextApiResponse } from "next";
 import { z } from "zod";
 import {
   type ingestionApiSchema,
   eventTypes,
   ingestionEvent,
+  traceEvent,
 } from "@/src/features/public-api/server/ingestion-api-schema";
 import { type ApiAccessScope } from "@/src/features/public-api/server/types";
-import { persistEventMiddleware } from "@/src/server/api/services/event-service";
+import {
+  persistEventBatchMiddleware,
+  persistEventMiddleware,
+} from "@/src/server/api/services/event-service";
 import { backOff } from "exponential-backoff";
 import { ResourceNotFoundError } from "@/src/utils/exceptions";
 import {
   SdkLogProcessor,
   type EventProcessor,
   TraceProcessor,
+  ObservationEvent,
 } from "../../../server/api/services/EventProcessor";
 import { ObservationProcessor } from "../../../server/api/services/EventProcessor";
 import { ScoreProcessor } from "../../../server/api/services/EventProcessor";
@@ -34,7 +39,15 @@ import {
   BaseError,
   ForbiddenError,
   UnauthorizedError,
+  Model,
+  Observation,
+  arrayOptionsFilter,
 } from "@langfuse/shared";
+import { AlertDescription } from "@/src/components/ui/alert";
+import { v4 } from "uuid";
+import { mergeJson } from "@/src/utils/json";
+import { update, merge } from "lodash";
+import { da } from "date-fns/locale";
 
 export const config = {
   api: {
@@ -173,6 +186,338 @@ const sortBatch = (batch: Array<z.infer<typeof ingestionEvent>>) => {
   return [...others, ...updates];
 };
 
+const ENABLE_SQL_BATCH = true;
+
+const findModelInMemory = (
+  projectId: string,
+  event: ObservationEvent,
+  allModels: Model[],
+  existingObservation: Observation | undefined,
+): Model | undefined => {
+  if (
+    event.type != eventTypes.GENERATION_CREATE &&
+    event.type != eventTypes.GENERATION_UPDATE
+  ) {
+    return undefined;
+  }
+
+  const model = event.body?.model;
+  const unit = event.body?.usage?.unit;
+  const startTime = event.body.startTime
+    ? new Date(event.body.startTime)
+    : undefined;
+
+  const matches = allModels.filter((m) => {
+    if (m.projectId != null && m.projectId != projectId) {
+      return false;
+    }
+
+    if (model) {
+      const matchPattern = m.matchPattern.replace("(?i)", "");
+      const pattern = new RegExp(matchPattern, "i");
+
+      if (!pattern.test(model)) {
+        return false;
+      }
+    } else if (
+      existingObservation &&
+      existingObservation.internalModel != m.modelName
+    ) {
+      return false;
+    }
+
+    const mergedUnit = unit ?? existingObservation?.unit;
+
+    if (mergedUnit && m.unit != mergedUnit) {
+      return false;
+    }
+
+    if (startTime && m.startDate && m.startDate > startTime) {
+      return false;
+    }
+  });
+
+  // sort matches by startDate which are of type Date in descending order
+  matches.sort((a, b) => {
+    if (a.startDate && b.startDate) {
+      return b.startDate.getTime() - a.startDate.getTime();
+    }
+    return 0;
+  });
+
+  return matches[0] || undefined;
+};
+
+export const handleSqlBatch = async (
+  events: z.infer<typeof ingestionApiSchema>["batch"],
+  metadata: z.infer<typeof ingestionApiSchema>["metadata"],
+  req: NextApiRequest,
+  apiScope: ApiAccessScope,
+) => {
+  if (apiScope.accessLevel != "all") {
+    throw new ForbiddenError("Access denied. Creation of events not allowed.");
+  }
+
+  const cleanedEvents = events.map((event) =>
+    ingestionEvent.parse(cleanEvent(event)),
+  );
+
+  // insert events into the DB
+  persistEventBatchMiddleware(
+    prisma,
+    apiScope.projectId,
+    req,
+    cleanedEvents,
+    metadata,
+  );
+
+  let results = [];
+
+  const traceEvents = cleanedEvents.filter(
+    (event): event is z.infer<typeof traceEvent> =>
+      event.type === eventTypes.TRACE_CREATE,
+  );
+
+  for (const event of traceEvents) {
+    const processor = new TraceProcessor(event);
+    const result = await processor.process(apiScope);
+    results.push({
+      result,
+      id: event.id,
+      type: event.type,
+    });
+  }
+
+  const observationEvents = cleanedEvents.filter(
+    (event): event is ObservationEvent =>
+      event.type === eventTypes.OBSERVATION_CREATE ||
+      event.type === eventTypes.OBSERVATION_UPDATE ||
+      event.type === eventTypes.EVENT_CREATE ||
+      event.type === eventTypes.SPAN_CREATE ||
+      event.type === eventTypes.SPAN_UPDATE ||
+      event.type === eventTypes.GENERATION_CREATE ||
+      event.type === eventTypes.GENERATION_UPDATE,
+  );
+
+  // find all observations by IDs to see which ones exist
+
+  const observationIds = observationEvents
+    .map((event) => event.body.id)
+    .filter((v): v is string => v !== undefined && v != null);
+
+  const observationTraceIds = observationEvents
+    .map((event) => event.body.traceId)
+    .filter((v): v is string => v !== undefined && v != null);
+
+  // all of these will get update events
+  const existingObservations = await prisma.observation.findMany({
+    where: {
+      id: {
+        in: observationIds,
+      },
+    },
+  });
+
+  const projectMatch = existingObservations.every(
+    (observation) => observation.projectId === apiScope.projectId,
+  );
+
+  if (!projectMatch) {
+    throw new ForbiddenError("Access denied. Observation from another project");
+  }
+
+  // find all the relevant models
+  const allModels = await prisma.model.findMany({});
+
+  // TODO: this needs a type
+  const newObservationsById = new Map<string, Observation>();
+  const updateObservationsById = new Map<string, Observation>();
+
+  for (const event of observationEvents) {
+    let type: "EVENT" | "SPAN" | "GENERATION";
+    switch (event.type) {
+      case eventTypes.OBSERVATION_CREATE:
+      case eventTypes.OBSERVATION_UPDATE:
+        throw new Error("observation events not supported in batch sql");
+      case eventTypes.EVENT_CREATE:
+        type = "EVENT" as const;
+        break;
+      case eventTypes.SPAN_CREATE:
+      case eventTypes.SPAN_UPDATE:
+        type = "SPAN" as const;
+        break;
+      case eventTypes.GENERATION_CREATE:
+      case eventTypes.GENERATION_UPDATE:
+        type = "GENERATION" as const;
+        break;
+    }
+
+    let existingObservation = newObservationsById.get(event.body.id);
+
+    let dbObservation = null;
+
+    if (!existingObservation) {
+      existingObservation = existingObservations.find(
+        (observation) => observation.id === event.body.id,
+      );
+      dbObservation = existingObservation;
+    }
+
+    const internalModel = findModelInMemory(
+      apiScope.projectId,
+      event,
+      allModels,
+      existingObservation,
+    );
+
+    if (!event.body.traceId && !existingObservation) {
+      throw new ValidationError(
+        `Observation with ID ${event.body.id} does not have a trace`,
+      );
+    }
+
+    const processor = new ObservationProcessor(event);
+
+    const [newInputCount, newOutputCount] =
+      "usage" in event.body
+        ? processor.calculateTokenCounts(
+            event.body,
+            internalModel ?? undefined,
+            existingObservation ?? undefined,
+          )
+        : [undefined, undefined];
+
+    // now we should either put an observation into the newObservations list.
+    // This doesn't pass type check later for some reason
+    const mergedMetadata = mergeJson(
+      existingObservation?.metadata
+        ? jsonSchema.parse(existingObservation.metadata)
+        : undefined,
+      event.body.metadata ?? undefined,
+    );
+
+    const observation: Partial<Observation> = {
+      id: event.body.id ?? v4(),
+      traceId: event.body.traceId || existingObservation?.traceId,
+      type: type,
+      name: event.body.name,
+      startTime: event.body.startTime
+        ? new Date(event.body.startTime)
+        : undefined,
+      endTime:
+        "endTime" in event.body && event.body.endTime
+          ? new Date(event.body.endTime)
+          : undefined,
+      completionStartTime:
+        "completionStartTime" in event.body && event.body.completionStartTime
+          ? new Date(event.body.completionStartTime)
+          : undefined,
+      metadata: mergedMetadata ?? undefined,
+      model: "model" in event.body ? event.body.model : undefined,
+      modelParameters:
+        "modelParameters" in event.body
+          ? event.body.modelParameters
+          : undefined,
+      input: event.body.input ?? undefined,
+      output: event.body.output ?? undefined,
+      promptTokens: newInputCount,
+      completionTokens: newOutputCount,
+      totalTokens:
+        "usage" in event.body
+          ? event.body.usage?.total ??
+            (newInputCount ?? 0) + (newOutputCount ?? 0)
+          : undefined,
+      unit:
+        "usage" in event.body
+          ? event.body.usage?.unit ?? internalModel?.unit
+          : internalModel?.unit,
+      level: event.body.level ?? undefined,
+      statusMessage: event.body.statusMessage ?? undefined,
+      parentObservationId: event.body.parentObservationId ?? undefined,
+      version: event.body.version ?? undefined,
+      projectId: apiScope.projectId,
+      promptId: undefined, // TODO: write logic for this.
+      internalModel: internalModel ? internalModel.modelName : undefined,
+      inputCost:
+        "usage" in event.body && event.body.usage?.inputCost
+          ? new Prisma.Decimal(event.body.usage?.inputCost)
+          : undefined,
+      outputCost:
+        "usage" in event.body && event.body.usage?.outputCost
+          ? new Prisma.Decimal(event.body.usage?.outputCost)
+          : undefined,
+      totalCost:
+        "usage" in event.body && event.body.usage?.totalCost
+          ? new Prisma.Decimal(event.body.usage?.totalCost)
+          : undefined,
+    };
+
+    // it's in the dictionary
+    if (newObservationsById.has(event.body.id)) {
+      const observationToUpdate = merge(
+        {},
+        newObservationsById.get(event.body.id),
+        observation,
+      );
+      newObservationsById.set(event.body.id, observationToUpdate);
+    } else if (updateObservationsById.has(event.body.id)) {
+      // have to be careful updating undefined keys here.
+      const observationToUpdate = merge(
+        {},
+        updateObservationsById.get(event.body.id),
+        observation,
+      );
+
+      updateObservationsById.set(event.body.id, observationToUpdate);
+    } else if (dbObservation) {
+      // it's in neither dictionary, but it's in the DB
+
+      const observationToUpdate = merge({}, dbObservation, observation);
+
+      updateObservationsById.set(event.body.id, observationToUpdate);
+    } else {
+      // it's not in any of the dictionaries, and it's not in the DB
+      newObservationsById.set(event.body.id, observation as Observation);
+    }
+  }
+
+  let newObservations = null;
+
+  if (newObservationsById.size > 0) {
+    newObservations = await prisma.observation.createMany({
+      // @ts-ignore
+      data: Array.from(newObservationsById.values()),
+    });
+  }
+
+  const updates = Array.from(updateObservationsById.entries()).map(
+    ([id, observation]) =>
+      prisma.observation.update({
+        where: { id },
+        // @ts-ignore
+        data: observation,
+      }),
+  );
+
+  if (updates.length > 0) {
+    await prisma.$transaction(updates);
+  }
+
+  // I have newObservationsById and updateObservationsById. I want to make a bulk prisma call
+  // to create or update these models in the DB
+
+  return {
+    results: Array.from(newObservationsById.values())
+      .concat(Array.from(updateObservationsById.values()))
+      .map((o) => ({
+        result: o,
+        id: o.id,
+        type: o.type,
+      })),
+    errors: [],
+  };
+};
+
 export const handleBatch = async (
   events: z.infer<typeof ingestionApiSchema>["batch"],
   metadata: z.infer<typeof ingestionApiSchema>["metadata"],
@@ -183,35 +528,46 @@ export const handleBatch = async (
 
   if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
 
-  const results: BatchResult[] = []; // Array to store the results
-
-  const errors: {
+  let errors: {
     error: unknown;
     id: string;
     type: string;
   }[] = []; // Array to store the errors
 
-  for (const singleEvent of events) {
-    try {
-      const result = await retry(async () => {
-        return await handleSingleEvent(
-          singleEvent,
-          metadata,
-          req,
-          authCheck.scope,
-        );
-      });
-      results.push({
-        result: result,
-        id: singleEvent.id,
-        type: singleEvent.type,
-      }); // Push each result into the array
-    } catch (error) {
-      // Handle or log the error if `handleSingleEvent` fails
-      console.error("Error handling event:", error);
-      // Decide how to handle the error: rethrow, continue, or push an error object to results
-      // For example, push an error object:
-      errors.push({ error: error, id: singleEvent.id, type: singleEvent.type });
+  let results: BatchResult[] = []; // Array to store the results
+
+  if (ENABLE_SQL_BATCH) {
+    const batch = await handleSqlBatch(events, metadata, req, authCheck.scope);
+
+    results = batch.results;
+    errors = batch.errors;
+  } else {
+    for (const singleEvent of events) {
+      try {
+        const result = await retry(async () => {
+          return await handleSingleEvent(
+            singleEvent,
+            metadata,
+            req,
+            authCheck.scope,
+          );
+        });
+        results.push({
+          result: result,
+          id: singleEvent.id,
+          type: singleEvent.type,
+        }); // Push each result into the array
+      } catch (error) {
+        // Handle or log the error if `handleSingleEvent` fails
+        console.error("Error handling event:", error);
+        // Decide how to handle the error: rethrow, continue, or push an error object to results
+        // For example, push an error object:
+        errors.push({
+          error: error,
+          id: singleEvent.id,
+          type: singleEvent.type,
+        });
+      }
     }
   }
 
@@ -253,9 +609,7 @@ const handleSingleEvent = async (
   req: NextApiRequest,
   apiScope: ApiAccessScope,
 ) => {
-  console.log(
-    `handling single event ${event.id} ${event.type}`
-  );
+  console.log(`handling single event ${event.id} ${event.type}`);
 
   const cleanedEvent = ingestionEvent.parse(cleanEvent(event));
 
